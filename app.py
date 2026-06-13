@@ -1,8 +1,6 @@
 import os
-import math
 import json
 from pathlib import Path
-from collections import defaultdict
 
 import google.generativeai as genai
 from pypdf import PdfReader
@@ -15,9 +13,14 @@ from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+from langchain_google_genai import GoogleGenerativeAIEmbeddings
+from langchain_core.vectorstores import InMemoryVectorStore
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_core.documents import Document
+
 # ── Config ─────────────────────────────────────────────────────────────────────
-CHUNK_SIZE    = 400
-CHUNK_OVERLAP = 60
+CHUNK_SIZE    = 1000  # Character count for RecursiveCharacterTextSplitter
+CHUNK_OVERLAP = 150   # Character overlap
 TOP_K         = 4
 UPLOAD_DIR    = Path("uploads")
 UPLOAD_DIR.mkdir(exist_ok=True)
@@ -29,23 +32,28 @@ if not api_key:
 genai.configure(api_key=api_key)
 model = genai.GenerativeModel("gemini-2.5-flash")
 
+# Initialize LangChain Embeddings & Vector Store
+embeddings = GoogleGenerativeAIEmbeddings(model="models/gemini-embedding-001", google_api_key=api_key)
+vector_store = InMemoryVectorStore(embeddings)
+
 app = FastAPI(title="RAG Chatbot — Gemini")
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
 # ── In-memory document store ───────────────────────────────────────────────────
-document_chunks: dict[str, list[dict]] = {}
+# Maps filename -> list of chunk IDs in vector_store
+document_chunks: dict[str, list[str]] = {}
 
 
 # ── RAG utilities ──────────────────────────────────────────────────────────────
-def chunk_text(text: str, source: str) -> list[dict]:
-    words  = text.split()
-    step   = CHUNK_SIZE - CHUNK_OVERLAP
-    result = []
-    for i in range(0, len(words), step):
-        snippet = " ".join(words[i : i + CHUNK_SIZE])
-        if snippet.strip():
-            result.append({"id": f"{source}::{i}", "text": snippet, "source": source})
-    return result
+def chunk_text(text: str, source: str) -> list[Document]:
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=CHUNK_SIZE,
+        chunk_overlap=CHUNK_OVERLAP
+    )
+    return text_splitter.create_documents(
+        texts=[text],
+        metadatas=[{"source": source}]
+    )
 
 
 def extract_text_from_file(file_path: Path) -> str:
@@ -67,53 +75,10 @@ def extract_text_from_file(file_path: Path) -> str:
             raise RuntimeError(f"Failed to read text file: {e}")
 
 
-def cosine_sim(a: list[float], b: list[float]) -> float:
-    dot = sum(x * y for x, y in zip(a, b))
-    na  = math.sqrt(sum(x * x for x in a))
-    nb  = math.sqrt(sum(x * x for x in b))
-    return dot / (na * nb) if na and nb else 0.0
-
-
-def tfidf_embed(query: str, corpus: list[str]) -> tuple[list[float], list[list[float]]]:
-    import re
-    tokenize = lambda t: re.sub(r'[^\w\s]', ' ', t.lower()).split()
-    vocab    = sorted({w for doc in [query] + corpus for w in tokenize(doc)})
-    w_idx    = {w: i for i, w in enumerate(vocab)}
-    N        = len(corpus)
-    df       = defaultdict(int)
-    for doc in corpus:
-        for w in set(tokenize(doc)):
-            df[w] += 1
-
-    def embed(text: str) -> list[float]:
-        words = tokenize(text)
-        n     = len(words) or 1
-        tf    = defaultdict(int)
-        for w in words:
-            tf[w] += 1
-        vec = [0.0] * len(vocab)
-        for w, cnt in tf.items():
-            if w in w_idx:
-                vec[w_idx[w]] = (cnt / n) * (math.log((N + 1) / (df[w] + 1)) + 1.0)
-        return vec
-
-    return embed(query), [embed(c) for c in corpus]
-
-
-def retrieve(query: str) -> list[dict]:
-    all_chunks = [c for cs in document_chunks.values() for c in cs]
-    if not all_chunks:
+def retrieve(query: str) -> list[Document]:
+    if not any(document_chunks.values()):
         return []
-    corpus    = [c["text"] for c in all_chunks]
-    qv, cvecs = tfidf_embed(query, corpus)
-    scored    = sorted(zip(all_chunks, cvecs),
-                       key=lambda x: cosine_sim(qv, x[1]), reverse=True)
-    
-    matches = [c for c, v in scored if cosine_sim(qv, v) > 0]
-    if matches:
-        return matches[:TOP_K]
-        
-    return [c for c, v in scored[:TOP_K]]
+    return vector_store.similarity_search(query, k=TOP_K)
 
 
 # ── Pydantic models ────────────────────────────────────────────────────────────
@@ -142,8 +107,22 @@ async def upload_file(file: UploadFile = File(...)):
         if target_path.exists():
             target_path.unlink()
         raise HTTPException(400, str(e))
-    chunks  = chunk_text(text, file.filename)
-    document_chunks[file.filename] = chunks
+    
+    # Chunk text using RecursiveCharacterTextSplitter
+    chunks = chunk_text(text, file.filename)
+    doc_ids = [f"{file.filename}::{i}" for i in range(len(chunks))]
+    
+    # If the file already exists in the vector store, delete its old chunks first
+    if file.filename in document_chunks:
+        try:
+            vector_store.delete(ids=document_chunks[file.filename])
+        except Exception as e:
+            print(f"Failed to delete old chunks for {file.filename}: {e}")
+
+    # Add to vector store and update tracking
+    vector_store.add_documents(documents=chunks, ids=doc_ids)
+    document_chunks[file.filename] = doc_ids
+
     return {"filename": file.filename, "chunks": len(chunks), "words": len(text.split())}
 
 
@@ -151,6 +130,12 @@ async def upload_file(file: UploadFile = File(...)):
 async def delete_doc(filename: str):
     if filename not in document_chunks:
         raise HTTPException(404, "Document not found")
+    
+    try:
+        vector_store.delete(ids=document_chunks[filename])
+    except Exception as e:
+        raise HTTPException(500, f"Failed to delete chunks from vector store: {e}")
+
     del document_chunks[filename]
     p = UPLOAD_DIR / filename
     if p.exists():
@@ -169,7 +154,7 @@ async def chat(req: ChatRequest):
 
     if retrieved:
         context = "\n\n".join(
-            f"[{i+1}] (source: {c['source']})\n{c['text']}"
+            f"[{i+1}] (source: {c.metadata.get('source', 'Unknown')})\n{c.page_content}"
             for i, c in enumerate(retrieved)
         )
     else:
@@ -184,7 +169,7 @@ async def chat(req: ChatRequest):
 
     response = model.generate_content(prompt)
     answer   = response.text
-    sources  = list({c["source"] for c in retrieved})
+    sources  = list({c.metadata.get("source", "Unknown") for c in retrieved})
     return ChatResponse(answer=answer, sources=sources, chunks_used=len(retrieved))
 
 
@@ -198,7 +183,9 @@ def startup_event():
                     try:
                         text = extract_text_from_file(file_path)
                         chunks = chunk_text(text, file_path.name)
-                        document_chunks[file_path.name] = chunks
+                        doc_ids = [f"{file_path.name}::{i}" for i in range(len(chunks))]
+                        vector_store.add_documents(documents=chunks, ids=doc_ids)
+                        document_chunks[file_path.name] = doc_ids
                         print(f"Indexed startup file: {file_path.name} ({len(chunks)} chunks)")
                     except Exception as e:
                         print(f"Failed to index startup file {file_path.name}: {e}")
